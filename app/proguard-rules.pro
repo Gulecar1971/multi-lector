@@ -1,0 +1,4 @@
+-keep class com.gustavo.multilector.** { *; }
+-keep class android.print.PdfPrinter { *; }
+-keep class android.print.PdfPrinter$* { *; }
+-dontwarn android.print.**
