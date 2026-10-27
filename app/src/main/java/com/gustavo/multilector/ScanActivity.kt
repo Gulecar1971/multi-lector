@@ -338,11 +338,12 @@ class ScanActivity : Activity() {
     /** Agrega hojas con retoque automático. Corre en segundo plano. */
     private fun addFiles(files: List<String>, detect: Boolean, filter: ScanFilter) {
         for (path in files) {
-            val q = if (detect) {
-                val small = loadSrc(path, 1600) ?: continue
-                Scan.detect(small).also { small.recycle() }
-            } else Scan.fullQuad(0f)
-            val auto = Edit(q, filter = filter, sharp = if (filter == ScanFilter.ORIGINAL) 0 else 30)
+            val small = loadSrc(path, 1600) ?: continue
+            val q = if (detect) Scan.detect(small) else Scan.fullQuad(0f)
+            // enderezado automático: mide lo torcido de los renglones después de recortar
+            val skew = if (detect) Scan.textSkew(Scan.warp(small, q, 1200f)) else 0f
+            small.recycle()
+            val auto = Edit(q, angle = -skew, filter = filter, sharp = if (filter == ScanFilter.ORIGINAL) 0 else 25)
             val p = Page(path, auto, auto, File(dir, "hoja_${System.nanoTime()}.jpg").path)
             render(p)
             runOnUiThread { pages.add(p) }
@@ -595,9 +596,11 @@ class PageEditor(
         spinner.visibility = View.VISIBLE
         exec.execute {
             val q = Scan.detect(src)
+            val skew = Scan.textSkew(Scan.warp(src, q, 1200f))
             main.post {
+                spinner.visibility = View.GONE
                 push(cur.copy(quad = q, filter = if (cur.filter == ScanFilter.ORIGINAL) ScanFilter.ENHANCED else cur.filter,
-                    bright = 0, contrast = 0, sat = 0, sharp = 30, shadows = true, angle = 0f))
+                    bright = 0, contrast = 0, sat = 0, sharp = 25, shadows = true, angle = -skew, rot = 0, mirror = false))
                 toast("Retoque automático aplicado")
             }
         }
@@ -761,6 +764,18 @@ class PageEditor(
         })
         rr.addView(sb, lp(0, WRAP, 1f))
         box.addView(rr)
+        val r2 = row()
+        r2.addView(act.smallButton("📐 Enderezar solo (según el texto)", Pal.accent) {
+            spinner.visibility = View.VISIBLE
+            exec.execute {
+                val sk = Scan.textSkew(Scan.rotate(Scan.warp(src, cur.quad, 1200f), cur.rot))
+                main.post {
+                    spinner.visibility = View.GONE
+                    if (sk == 0f) toast("Ya está derecho (o no encontré renglones de texto)") else { push(cur.copy(angle = -sk)); panel.removeAllViews(); rotatePanel() }
+                }
+            }
+        }, lp(MATCH, WRAP))
+        box.addView(r2)
         box.addView(act.label("Usá Enderezar si las líneas del texto quedaron un poco torcidas.", 12.5f, Color.LTGRAY).apply { setPadding(act.dp(12), act.dp(4), act.dp(12), 0) })
         panelScroll(box)
     }

@@ -67,6 +67,7 @@ object Scan {
             if (small !== b) small.recycle()
             var lum = IntArray(w * h) { val p = px[it]; (((p shr 16) and 0xFF) * 299 + ((p shr 8) and 0xFF) * 587 + (p and 0xFF) * 114) / 1000 }
             repeat(2) { lum = boxBlur(lum, w, h, 2) }
+            val hq = houghQuad(lum, w, h)
             // umbral de Otsu
             val hist = IntArray(256)
             for (v in lum) hist[v.coerceIn(0, 255)]++
@@ -102,7 +103,7 @@ object Scan {
                 }
                 if (area > bestArea) { bestArea = area; bestLabel = cur }
             }
-            if (bestArea < total * 0.10) return fullQuad()
+            if (bestArea < total * 0.10 || bestArea > total * 0.93) return hq ?: fullQuad()
             var tl = 0; var tr = 0; var br = 0; var bl = 0
             var minS = Int.MAX_VALUE; var maxS = Int.MIN_VALUE; var minD = Int.MAX_VALUE; var maxD = Int.MIN_VALUE
             for (i in 0 until total) {
@@ -117,10 +118,153 @@ object Scan {
             val q = FloatArray(8)
             fun set(k: Int, i: Int) { q[k * 2] = (i % w + 0.5f) / w; q[k * 2 + 1] = (i / w + 0.5f) / h }
             set(0, tl); set(1, tr); set(2, br); set(3, bl)
-            if (quadArea(q) < 0.10f) return fullQuad()
+            if (quadArea(q) < 0.10f) return hq ?: fullQuad()
+            // si los bordes rectos encontraron una hoja parecida pero más prolija, usamos esa
+            if (hq != null && Math.abs(quadArea(hq) - quadArea(q)) < 0.12f) return hq
             return q
         } catch (_: Throwable) {
             return fullQuad()
+        }
+    }
+
+    /**
+     * Busca los 4 bordes rectos de la hoja (transformada de Hough). Sirve cuando la hoja
+     * está sobre una mesa clara y no se distingue por color.
+     */
+    fun houghQuad(lum: IntArray, w: Int, h: Int): FloatArray? {
+        try {
+            // bordes (Sobel)
+            val mag = IntArray(w * h)
+            var maxM = 1
+            for (y in 1 until h - 1) for (x in 1 until w - 1) {
+                val i = y * w + x
+                val gx = (lum[i - w + 1] + 2 * lum[i + 1] + lum[i + w + 1]) - (lum[i - w - 1] + 2 * lum[i - 1] + lum[i + w - 1])
+                val gy = (lum[i + w - 1] + 2 * lum[i + w] + lum[i + w + 1]) - (lum[i - w - 1] + 2 * lum[i - w] + lum[i - w + 1])
+                val m = Math.abs(gx) + Math.abs(gy)
+                mag[i] = m
+                if (m > maxM) maxM = m
+            }
+            val hist = IntArray(256)
+            for (m in mag) hist[m * 255 / maxM]++
+            var acc = 0; var thrBin = 255
+            for (k in 255 downTo 0) { acc += hist[k]; if (acc > mag.size * 0.08) { thrBin = k; break } }
+            val thr = maxOf(12, thrBin * maxM / 255)
+            val diag = Math.ceil(Math.hypot(w.toDouble(), h.toDouble())).toInt()
+            val nT = 180
+            val cosT = DoubleArray(nT) { Math.cos(Math.toRadians(it.toDouble())) }
+            val sinT = DoubleArray(nT) { Math.sin(Math.toRadians(it.toDouble())) }
+            val votes = IntArray(nT * (2 * diag + 1))
+            for (y in 1 until h - 1) for (x in 1 until w - 1) {
+                if (mag[y * w + x] < thr) continue
+                for (t in 0 until nT) {
+                    // solo ángulos casi horizontales o casi verticales (la hoja puede estar torcida hasta ~25°)
+                    if (t in 26..64 || t in 116..154) continue
+                    val r = Math.round(x * cosT[t] + y * sinT[t]).toInt() + diag
+                    votes[t * (2 * diag + 1) + r]++
+                }
+            }
+            class L(val t: Int, val r: Int, val v: Int)
+            val lines = ArrayList<L>()
+            val stride = 2 * diag + 1
+            for (t in 0 until nT) for (r in 1 until stride - 1) {
+                val v = votes[t * stride + r]
+                if (v < minOf(w, h) / 5) continue
+                // máximo local
+                var ok = true
+                loop@ for (dt in -2..2) for (dr in -3..3) {
+                    if (dt == 0 && dr == 0) continue
+                    val tt = (t + dt + nT) % nT; val rr = r + dr
+                    if (rr < 0 || rr >= stride) continue
+                    if (votes[tt * stride + rr] > v) { ok = false; break@loop }
+                }
+                if (ok) lines.add(L(t, r - diag, v))
+            }
+            fun posAt(l: L, horizontal: Boolean): Double {
+                val th = Math.toRadians(l.t.toDouble())
+                return if (horizontal) (l.r - (w / 2.0) * Math.cos(th)) / Math.sin(th) // y en el centro
+                else (l.r - (h / 2.0) * Math.sin(th)) / Math.cos(th)                    // x en el centro
+            }
+            val hor = lines.filter { it.t in 65..115 }
+            val ver = lines.filter { it.t <= 25 || it.t >= 155 }
+            fun pick(c: List<L>, horizontal: Boolean, first: Boolean): L? {
+                val size = if (horizontal) h else w
+                val side = c.filter { val p = posAt(it, horizontal); if (first) p < size * 0.5 && p > -size * 0.05 else p > size * 0.5 && p < size * 1.05 }
+                val best = side.maxOfOrNull { it.v } ?: return null
+                val strong = side.filter { it.v >= best * 0.25 && it.v >= (if (horizontal) w else h) / 4 }
+                // la línea fuerte más de afuera es el borde del papel (adentro están los renglones)
+                return if (first) strong.minByOrNull { posAt(it, horizontal) } else strong.maxByOrNull { posAt(it, horizontal) }
+            }
+            val top = pick(hor, true, true) ?: return null
+            val bot = pick(hor, true, false) ?: return null
+            val left = pick(ver, false, true) ?: return null
+            val right = pick(ver, false, false) ?: return null
+            fun inter(a: L, b: L): DoubleArray? {
+                val t1 = Math.toRadians(a.t.toDouble()); val t2 = Math.toRadians(b.t.toDouble())
+                val det = Math.cos(t1) * Math.sin(t2) - Math.sin(t1) * Math.cos(t2)
+                if (Math.abs(det) < 1e-6) return null
+                val x = (a.r * Math.sin(t2) - b.r * Math.sin(t1)) / det
+                val y = (b.r * Math.cos(t1) - a.r * Math.cos(t2)) / det
+                return doubleArrayOf(x, y)
+            }
+            val pts = listOf(inter(top, left), inter(top, right), inter(bot, right), inter(bot, left))
+            if (pts.any { it == null }) return null
+            val q = FloatArray(8)
+            pts.forEachIndexed { k, p ->
+                q[k * 2] = (p!![0] / w).toFloat().coerceIn(0f, 1f)
+                q[k * 2 + 1] = (p[1] / h).toFloat().coerceIn(0f, 1f)
+            }
+            val a = quadArea(q)
+            return if (a in 0.30f..0.97f) q else null
+        } catch (_: Throwable) {
+            return null
+        }
+    }
+
+    /**
+     * Mide cuánto están torcidos los renglones del texto (en grados). 0 si no se puede saber.
+     * Para enderezar hay que girar al revés: straighten(-angulo).
+     */
+    fun textSkew(b: Bitmap): Float {
+        try {
+            val s = 900f / maxOf(b.width, b.height)
+            val w = maxOf(8, (b.width * minOf(1f, s)).toInt()); val h = maxOf(8, (b.height * minOf(1f, s)).toInt())
+            val small = Bitmap.createScaledBitmap(b, w, h, true)
+            val px = IntArray(w * h)
+            small.getPixels(px, 0, w, 0, 0, w, h)
+            if (small !== b) small.recycle()
+            val lum = IntArray(w * h) { val p = px[it]; (((p shr 16) and 0xFF) * 299 + ((p shr 8) and 0xFF) * 587 + (p and 0xFF) * 114) / 1000 }
+            val bg = background(lum, w, h)
+            val xs = ArrayList<Int>(); val ys = ArrayList<Int>()
+            // puntos oscuros (tinta), dejando un margen
+            val mx = w / 20; val my = h / 20
+            for (y in my until h - my step 1) for (x in mx until w - mx step 1) {
+                if (lum[y * w + x] < bg(x, y) * 0.62f) { xs.add(x); ys.add(y) }
+            }
+            if (xs.size < 300) return 0f
+            val stepPick = maxOf(1, xs.size / 60000)
+            fun score(deg: Double): Double {
+                val t = Math.tan(Math.toRadians(deg))
+                val bins = IntArray(h * 2 + 2)
+                var i = 0
+                while (i < xs.size) {
+                    val r = Math.round(ys[i] - xs[i] * t).toInt() + h
+                    if (r in bins.indices) bins[r]++
+                    i += stepPick
+                }
+                var sc = 0.0
+                for (v in bins) sc += v.toDouble() * v
+                return sc
+            }
+            var best = 0.0; var bestS = score(0.0)
+            val base = bestS
+            var a = -12.0
+            while (a <= 12.0) { val sc = score(a); if (sc > bestS) { bestS = sc; best = a }; a += 0.5 }
+            var f = best - 0.5
+            while (f <= best + 0.5) { val sc = score(f); if (sc > bestS) { bestS = sc; best = f }; f += 0.1 }
+            if (Math.abs(best) < 0.25 || bestS < base * 1.08) return 0f
+            return best.toFloat()
+        } catch (_: Throwable) {
+            return 0f
         }
     }
 
@@ -295,8 +439,9 @@ object Scan {
                         else -> {
                             val p = px[i]
                             fun c(v: Int): Int {
-                                val r = ((v * k - 25f) * 255f / (238f - 25f)).toInt().coerceIn(0, 255)
-                                return if (r > 240) 255 else r
+                                // suave: aclara el papel sin quemar los colores ni el texto claro
+                                val r = ((v * k - 12f) * 255f / (250f - 12f)).toInt().coerceIn(0, 255)
+                                return if (r > 248) 255 else r
                             }
                             px[i] = (0xFF shl 24) or (c((p shr 16) and 0xFF) shl 16) or (c((p shr 8) and 0xFF) shl 8) or c(p and 0xFF)
                         }
