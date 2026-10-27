@@ -3,14 +3,50 @@ package com.gustavo.multilector
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
 import android.graphics.Paint
+import org.json.JSONArray
+import org.json.JSONObject
 
-enum class ScanFilter(val label: String) {
-    ENHANCED("✨ Mejorado"),
-    DOCUMENT("📄 Blanco y negro"),
-    GRAY("🌫 Gris"),
-    ORIGINAL("🖼 Original")
+enum class ScanFilter(val label: String, val desc: String) {
+    ENHANCED("✨ Mejorado", "Fondo blanco, sin sombras, colores reales"),
+    MAGIC("🪄 Color intenso", "Como Mejorado pero con colores más vivos"),
+    DOCUMENT("📄 Blanco y negro", "Texto bien negro. Ideal facturas e impresora B/N"),
+    INK("🖨 Ahorro de tinta", "Blanco y negro más liviano, gasta menos tinta"),
+    GRAY("🌫 Gris", "Sin color, suave"),
+    PHOTO("📷 Foto", "Para fotos, DNI o carnets: solo mejora luz y color"),
+    ORIGINAL("🖼 Original", "Como salió la foto (solo recortada)")
+}
+
+/** Todos los retoques de una hoja. Se guardan para poder rehacerlos cuando quieras. */
+data class Edit(
+    val quad: FloatArray,
+    val rot: Int = 0,          // 0, 90, 180, 270
+    val angle: Float = 0f,     // enderezado fino, -15..15 grados
+    val mirror: Boolean = false,
+    val filter: ScanFilter = ScanFilter.ENHANCED,
+    val bright: Int = 0,       // -100..100
+    val contrast: Int = 0,     // -100..100
+    val sat: Int = 0,          // -100..100
+    val sharp: Int = 30,       // 0..100
+    val shadows: Boolean = true
+) {
+    fun toJson(): JSONObject = JSONObject().put("q", JSONArray(quad.map { it.toDouble() })).put("rot", rot).put("ang", angle.toDouble())
+        .put("mir", mirror).put("f", filter.name).put("b", bright).put("c", contrast).put("s", sat).put("sh", sharp).put("so", shadows)
+
+    override fun equals(other: Any?) = other is Edit && toJson().toString() == other.toJson().toString()
+    override fun hashCode() = toJson().toString().hashCode()
+
+    companion object {
+        fun fromJson(o: JSONObject): Edit {
+            val q = o.getJSONArray("q")
+            return Edit(FloatArray(8) { q.getDouble(it).toFloat() }, o.optInt("rot"), o.optDouble("ang", 0.0).toFloat(), o.optBoolean("mir"),
+                try { ScanFilter.valueOf(o.optString("f", "ENHANCED")) } catch (_: Exception) { ScanFilter.ENHANCED },
+                o.optInt("b"), o.optInt("c"), o.optInt("s"), o.optInt("sh", 30), o.optBoolean("so", true))
+        }
+    }
 }
 
 /** Escáner: detectar la hoja, enderezarla y limpiarla. Todo hecho a mano, sin librerías. */
@@ -146,68 +182,124 @@ object Scan {
         return r
     }
 
-    /** Limpia la hoja: blanquea el fondo, saca sombras y realza el texto. */
-    fun filter(b: Bitmap, f: ScanFilter): Bitmap {
+    /** Enderezado fino (pocos grados) y espejo, sin dejar bordes vacíos. */
+    fun straighten(b: Bitmap, angle: Float, mirror: Boolean): Bitmap {
+        if (Math.abs(angle) < 0.05f && !mirror) return b
+        val w = b.width.toFloat(); val h = b.height.toFloat()
+        val rad = Math.toRadians(Math.abs(angle).toDouble())
+        val cover = (Math.cos(rad) + Math.sin(rad) * maxOf(w / h, h / w)).toFloat()
+        val out = Bitmap.createBitmap(b.width, b.height, Bitmap.Config.ARGB_8888)
+        out.eraseColor(Color.WHITE)
+        val m = Matrix()
+        m.postTranslate(-w / 2, -h / 2)
+        if (mirror) m.postScale(-1f, 1f)
+        m.postRotate(angle)
+        m.postScale(cover, cover)
+        m.postTranslate(w / 2, h / 2)
+        Canvas(out).drawBitmap(b, m, Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG))
+        b.recycle()
+        return out
+    }
+
+    /** Fondo del papel estimado por zonas (lo más claro de cada zona, suavizado). Sirve para sacar sombras. */
+    private fun background(lum: IntArray, w: Int, h: Int): (Int, Int) -> Float {
+        val bs = maxOf(8, maxOf(w, h) / 90)
+        val bw = (w + bs - 1) / bs; val bh = (h + bs - 1) / bs
+        var bg = IntArray(bw * bh)
+        for (by in 0 until bh) for (bx in 0 until bw) {
+            var mx = 0
+            var y = by * bs
+            while (y < minOf(h, (by + 1) * bs)) {
+                var x = bx * bs
+                while (x < minOf(w, (bx + 1) * bs)) { val v = lum[y * w + x]; if (v > mx) mx = v; x += 2 }
+                y += 2
+            }
+            bg[by * bw + bx] = mx
+        }
+        repeat(2) {
+            val n = IntArray(bg.size)
+            for (y in 0 until bh) for (x in 0 until bw) {
+                var mx = 0
+                for (dy in -1..1) for (dx in -1..1) {
+                    val xx = (x + dx).coerceIn(0, bw - 1); val yy = (y + dy).coerceIn(0, bh - 1)
+                    mx = maxOf(mx, bg[yy * bw + xx])
+                }
+                n[y * bw + x] = mx
+            }
+            bg = n
+        }
+        bg = boxBlur(bg, bw, bh, 2)
+        val fin = bg
+        return { x, y ->
+            val fy = ((y + 0.5f) / bs - 0.5f).coerceIn(0f, (bh - 1).toFloat())
+            val y0 = fy.toInt(); val y1 = minOf(bh - 1, y0 + 1); val ty = fy - y0
+            val fx = ((x + 0.5f) / bs - 0.5f).coerceIn(0f, (bw - 1).toFloat())
+            val x0 = fx.toInt(); val x1 = minOf(bw - 1, x0 + 1); val tx = fx - x0
+            val top = fin[y0 * bw + x0] * (1 - tx) + fin[y0 * bw + x1] * tx
+            val bot = fin[y1 * bw + x0] * (1 - tx) + fin[y1 * bw + x1] * tx
+            maxOf(40f, top * (1 - ty) + bot * ty)
+        }
+    }
+
+    /** Niveles automáticos: estira entre el 0,5% más oscuro y el 0,5% más claro de cada color. */
+    private fun autoLevels(px: IntArray) {
+        val hr = IntArray(256); val hg = IntArray(256); val hb = IntArray(256)
+        var i = 0
+        while (i < px.size) { val p = px[i]; hr[(p shr 16) and 0xFF]++; hg[(p shr 8) and 0xFF]++; hb[p and 0xFF]++; i += 3 }
+        val n = (px.size + 2) / 3
+        fun lo(h: IntArray): Int { var a = 0; for (k in 0..255) { a += h[k]; if (a > n * 0.005) return k }; return 0 }
+        fun hi(h: IntArray): Int { var a = 0; for (k in 255 downTo 0) { a += h[k]; if (a > n * 0.005) return k }; return 255 }
+        val lr = lo(hr); val hrr = maxOf(lr + 30, hi(hr)); val lg = lo(hg); val hgg = maxOf(lg + 30, hi(hg)); val lb = lo(hb); val hbb = maxOf(lb + 30, hi(hb))
+        val mr = IntArray(256) { ((it - lr) * 255 / (hrr - lr)).coerceIn(0, 255) }
+        val mg = IntArray(256) { ((it - lg) * 255 / (hgg - lg)).coerceIn(0, 255) }
+        val mb = IntArray(256) { ((it - lb) * 255 / (hbb - lb)).coerceIn(0, 255) }
+        for (k in px.indices) { val p = px[k]; px[k] = (0xFF shl 24) or (mr[(p shr 16) and 0xFF] shl 16) or (mg[(p shr 8) and 0xFF] shl 8) or mb[p and 0xFF] }
+    }
+
+    /** Limpia la hoja según el filtro elegido. */
+    fun filter(b: Bitmap, f: ScanFilter, shadows: Boolean = true): Bitmap {
         if (f == ScanFilter.ORIGINAL) return b
         val w = b.width; val h = b.height
         val px = IntArray(w * h)
         b.getPixels(px, 0, w, 0, 0, w, h)
-        val lum = IntArray(w * h) { val p = px[it]; (((p shr 16) and 0xFF) * 299 + ((p shr 8) and 0xFF) * 587 + (p and 0xFF) * 114) / 1000 }
-        if (f == ScanFilter.GRAY) {
-            for (i in px.indices) { val v = lum[i]; px[i] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v }
+        if (f == ScanFilter.PHOTO) {
+            autoLevels(px)
         } else {
-            // fondo (papel) estimado por bloques: lo más claro de cada zona, suavizado
-            val bs = maxOf(8, maxOf(w, h) / 90)
-            val bw = (w + bs - 1) / bs; val bh = (h + bs - 1) / bs
-            var bg = IntArray(bw * bh)
-            for (by in 0 until bh) for (bx in 0 until bw) {
-                var mx = 0
-                var y = by * bs
-                while (y < minOf(h, (by + 1) * bs)) {
-                    var x = bx * bs
-                    while (x < minOf(w, (bx + 1) * bs)) { val v = lum[y * w + x]; if (v > mx) mx = v; x += 2 }
-                    y += 2
+            val lum = IntArray(w * h) { val p = px[it]; (((p shr 16) and 0xFF) * 299 + ((p shr 8) and 0xFF) * 587 + (p and 0xFF) * 114) / 1000 }
+            if (f == ScanFilter.GRAY && !shadows) {
+                for (i in px.indices) { val v = lum[i]; px[i] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v }
+            } else {
+                // sin "quitar sombras": usamos un fondo parejo (el blanco más común de la hoja)
+                val bgf: (Int, Int) -> Float = if (shadows) background(lum, w, h) else {
+                    val hist = IntArray(256); for (v in lum) hist[v]++
+                    var a = 0; var paper = 255
+                    for (k in 255 downTo 0) { a += hist[k]; if (a > lum.size * 0.10) { paper = k; break } }
+                    val pv = maxOf(60f, paper.toFloat()); { _, _ -> pv }
                 }
-                bg[by * bw + bx] = mx
-            }
-            // agrandar lo claro (tapa letras grandes) y suavizar
-            repeat(2) {
-                val n = IntArray(bg.size)
-                for (y in 0 until bh) for (x in 0 until bw) {
-                    var mx = 0
-                    for (dy in -1..1) for (dx in -1..1) {
-                        val xx = (x + dx).coerceIn(0, bw - 1); val yy = (y + dy).coerceIn(0, bh - 1)
-                        mx = maxOf(mx, bg[yy * bw + xx])
-                    }
-                    n[y * bw + x] = mx
-                }
-                bg = n
-            }
-            bg = boxBlur(bg, bw, bh, 2)
-            for (y in 0 until h) {
-                val fy = ((y + 0.5f) / bs - 0.5f).coerceIn(0f, (bh - 1).toFloat())
-                val y0 = fy.toInt(); val y1 = minOf(bh - 1, y0 + 1); val ty = fy - y0
-                for (x in 0 until w) {
-                    val fx = ((x + 0.5f) / bs - 0.5f).coerceIn(0f, (bw - 1).toFloat())
-                    val x0 = fx.toInt(); val x1 = minOf(bw - 1, x0 + 1); val tx = fx - x0
-                    val top = bg[y0 * bw + x0] * (1 - tx) + bg[y0 * bw + x1] * tx
-                    val bot = bg[y1 * bw + x0] * (1 - tx) + bg[y1 * bw + x1] * tx
-                    val back = maxOf(40f, top * (1 - ty) + bot * ty)
+                for (y in 0 until h) for (x in 0 until w) {
                     val i = y * w + x
-                    val k = 255f / back
-                    if (f == ScanFilter.DOCUMENT) {
-                        val n = lum[i] * k
-                        var v = ((n - 95f) * 255f / (232f - 95f)).toInt().coerceIn(0, 255)
-                        if (v > 215) v = 255
-                        px[i] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
-                    } else {
-                        val p = px[i]
-                        fun c(v: Int): Int {
-                            val n = v * k
-                            val r = ((n - 25f) * 255f / (238f - 25f)).toInt().coerceIn(0, 255)
-                            return if (r > 240) 255 else r
+                    val k = 255f / bgf(x, y)
+                    when (f) {
+                        ScanFilter.DOCUMENT, ScanFilter.INK -> {
+                            val n = lum[i] * k
+                            var v = if (f == ScanFilter.DOCUMENT) ((n - 95f) * 255f / (232f - 95f)).toInt()
+                            else ((n - 60f) * 255f / (225f - 60f)).toInt() + 40
+                            v = v.coerceIn(0, 255)
+                            if (v > 215) v = 255
+                            px[i] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
                         }
-                        px[i] = (0xFF shl 24) or (c((p shr 16) and 0xFF) shl 16) or (c((p shr 8) and 0xFF) shl 8) or c(p and 0xFF)
+                        ScanFilter.GRAY -> {
+                            val v = ((lum[i] * k - 20f) * 255f / 235f).toInt().coerceIn(0, 255).let { if (it > 245) 255 else it }
+                            px[i] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
+                        }
+                        else -> {
+                            val p = px[i]
+                            fun c(v: Int): Int {
+                                val r = ((v * k - 25f) * 255f / (238f - 25f)).toInt().coerceIn(0, 255)
+                                return if (r > 240) 255 else r
+                            }
+                            px[i] = (0xFF shl 24) or (c((p shr 16) and 0xFF) shl 16) or (c((p shr 8) and 0xFF) shl 8) or c(p and 0xFF)
+                        }
                     }
                 }
             }
@@ -218,10 +310,58 @@ object Scan {
         return out
     }
 
-    /** Proceso completo de una hoja. */
-    fun process(src: Bitmap, quad: FloatArray, rot: Int, f: ScanFilter, maxSide: Float = 3300f): Bitmap {
-        val warped = warp(src, quad, maxSide)
-        val rotated = rotate(warped, rot)
-        return filter(rotated, f)
+    /** Brillo, contraste y color. */
+    fun adjust(b: Bitmap, bright: Int, contrast: Int, sat: Int): Bitmap {
+        if (bright == 0 && contrast == 0 && sat == 0) return b
+        val cm = ColorMatrix()
+        cm.setSaturation((100 + sat) / 100f)
+        val c = (100 + contrast) / 100f
+        val t = 128f * (1 - c) + bright * 1.1f
+        cm.postConcat(ColorMatrix(floatArrayOf(c, 0f, 0f, 0f, t, 0f, c, 0f, 0f, t, 0f, 0f, c, 0f, t, 0f, 0f, 0f, 1f, 0f)))
+        val out = Bitmap.createBitmap(b.width, b.height, Bitmap.Config.ARGB_8888)
+        Canvas(out).drawBitmap(b, 0f, 0f, Paint().apply { colorFilter = ColorMatrixColorFilter(cm) })
+        b.recycle()
+        return out
+    }
+
+    /** Nitidez (máscara de enfoque): realza los bordes de las letras. */
+    fun sharpen(b: Bitmap, amount: Int): Bitmap {
+        if (amount <= 0) return b
+        val w = b.width; val h = b.height
+        val px = IntArray(w * h)
+        b.getPixels(px, 0, w, 0, 0, w, h)
+        val out = IntArray(w * h)
+        val a = amount / 50f
+        for (y in 0 until h) {
+            val ym = if (y > 0) y - 1 else y; val yp = if (y < h - 1) y + 1 else y
+            for (x in 0 until w) {
+                val xm = if (x > 0) x - 1 else x; val xp = if (x < w - 1) x + 1 else x
+                val p = px[y * w + x]
+                val n1 = px[ym * w + x]; val n2 = px[yp * w + x]; val n3 = px[y * w + xm]; val n4 = px[y * w + xp]
+                fun ch(s: Int): Int {
+                    val c = (p shr s) and 0xFF
+                    val avg = (((n1 shr s) and 0xFF) + ((n2 shr s) and 0xFF) + ((n3 shr s) and 0xFF) + ((n4 shr s) and 0xFF)) / 4f
+                    return (c + a * (c - avg)).toInt().coerceIn(0, 255)
+                }
+                out[y * w + x] = (0xFF shl 24) or (ch(16) shl 16) or (ch(8) shl 8) or ch(0)
+            }
+        }
+        val r = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        r.setPixels(out, 0, w, 0, 0, w, h)
+        b.recycle()
+        return r
+    }
+
+    /** Proceso completo de una hoja con todos sus retoques. */
+    fun process(src: Bitmap, e: Edit, maxSide: Float = 3300f): Bitmap {
+        val full = e.quad.contentEquals(fullQuad(0f))
+        var b = if (full && maxOf(src.width, src.height) <= maxSide) src.copy(Bitmap.Config.ARGB_8888, true) else warp(src, e.quad, maxSide)
+        b = rotate(b, e.rot)
+        b = straighten(b, e.angle, e.mirror)
+        b = filter(b, e.filter, e.shadows)
+        b = adjust(b, e.bright, e.contrast + if (e.filter == ScanFilter.MAGIC) 12 else 0, e.sat + if (e.filter == ScanFilter.MAGIC) 45 else 0)
+        // la nitidez se ajusta al tamaño para que la vista previa se parezca al resultado final
+        b = sharpen(b, if (maxSide < 2000) e.sharp / 2 else e.sharp)
+        return b
     }
 }
