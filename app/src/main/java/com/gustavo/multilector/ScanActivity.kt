@@ -300,7 +300,7 @@ class ScanActivity : Activity() {
                     val files = uris.mapIndexedNotNull { k, u ->
                         try { F.copyTo(this, u, File(dir, "g_${System.currentTimeMillis()}_$k.jpg")).path } catch (_: Exception) { null }
                     }
-                    // Google ya recortó y limpió: arrancamos con "Original" para no retocar dos veces.
+                    // Google ya recortó y limpió: no se vuelve a aclarar; solo se endereza el texto si quedó torcido.
                     addFiles(files, detect = false, filter = ScanFilter.ORIGINAL)
                     runOnUiThread { refresh(); if (files.isNotEmpty()) toast("Listo: ${files.size} hoja(s). Tocá una si querés retocarla.") }
                 }
@@ -341,7 +341,7 @@ class ScanActivity : Activity() {
             val small = loadSrc(path, 1600) ?: continue
             val q = if (detect) Scan.detect(small) else Scan.fullQuad(0f)
             // enderezado automático: mide lo torcido de los renglones después de recortar
-            val skew = if (detect) Scan.textSkew(Scan.warp(small, q, 1200f)) else 0f
+            val skew = if (detect) Scan.textSkew(Scan.warp(small, q, 1200f)) else Scan.textSkew(small)
             small.recycle()
             val auto = Edit(q, angle = -skew, filter = filter, sharp = if (filter == ScanFilter.ORIGINAL) 0 else 25)
             val p = Page(path, auto, auto, File(dir, "hoja_${System.nanoTime()}.jpg").path)
