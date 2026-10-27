@@ -59,7 +59,13 @@ object Jobs {
                 F.view(act, f.local)
             }
             b.setNeutralButton("Compartir") { _, _ -> F.shareFiles(act, r.files.map { it.local }) }
-            b.setNegativeButton("Listo", null)
+            val f0 = r.files[0].local
+            when {
+                F.ext(f0.name) == "pdf" -> b.setNegativeButton("🖨 Imprimir") { _, _ -> Printer.start(act, f0, f0.name) }
+                r.files.all { F.isImageMime(F.mimeFromExt(F.ext(it.local.name))) } ->
+                    b.setNegativeButton("🖨 Imprimir") { _, _ -> Printer.any(act, r.files.map { F.providerUri(act, it.local) }) }
+                else -> b.setNegativeButton("Listo", null)
+            }
         } else if (r.extra != null) {
             b.setPositiveButton(r.extra.first) { _, _ -> r.extra.second() }
             b.setNegativeButton("Cerrar", null)

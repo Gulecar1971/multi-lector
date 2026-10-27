@@ -275,7 +275,7 @@ object F {
      */
     fun savePublic(ctx: Context, src: File, displayName: String, mime: String, sub: String = "", toDownloads: Boolean = false): Uri? {
         val image = isImageMime(mime) && !toDownloads
-        val subPath = if (sub.isNotBlank()) "/" + safe(sub) else ""
+        val subPath = if (sub.isNotBlank()) "/" + sub.split('/').filter { it.isNotBlank() }.joinToString("/") { safe(it) } else ""
         return try {
             if (Build.VERSION.SDK_INT >= 29) {
                 val rel = (if (image) Environment.DIRECTORY_PICTURES else Environment.DIRECTORY_DOWNLOADS) + "/MultiLector" + subPath

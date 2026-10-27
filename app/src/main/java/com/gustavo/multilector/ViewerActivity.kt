@@ -137,6 +137,7 @@ class ViewerActivity : Activity() {
                     content.addView(pl, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or Gravity.END).apply { setMargins(0, dp(8), dp(8), 0) })
                     btn("➖") { pane.setZoom(pane.zoom / 1.4f) }
                     btn("➕") { pane.setZoom(pane.zoom * 1.4f) }
+                    btn("🖨 Imprimir", Color.parseColor("#0D47A1")) { Printer.any(this, listOf(uri)) }
                     btn("🔢 Ir a pág.") { askPage(d.count) }
                     btn("📤 Sacar fotos", Pal.purple) { Ops.extractImages(this, uri) }
                     btn("🖼 Páginas a fotos", Pal.teal) {
@@ -189,6 +190,7 @@ class ViewerActivity : Activity() {
                 info.background = rounded(Color.argb(150, 0, 0, 0), dpf(10f))
                 info.setPadding(dp(8), dp(3), dp(8), dp(3))
                 content.addView(info, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or Gravity.START).apply { setMargins(dp(8), dp(8), 0, 0) })
+                btn("🖨 Imprimir", Color.parseColor("#0D47A1")) { Printer.any(this, listOf(uri)) }
                 btn("📄 A PDF", Pal.accent) { askPhotoPdf(this, listOf(uri)) }
                 btn("📐 Cambiar tamaño/formato", Pal.pink) { PhotoActivity.start(this, listOf(uri)) }
                 commonButtons()
@@ -225,6 +227,7 @@ class ViewerActivity : Activity() {
                     }
                     wv.loadUrl(Uri.fromFile(f).toString())
                     content.addView(wv, FrameLayout.LayoutParams(MATCH, MATCH))
+                    btn("🖨 Imprimir", Color.parseColor("#0D47A1")) { Printer.web(this, wv, name) }
                     btn("📄 Convertir a PDF", Pal.accent) { docToPdf() }
                     btn("🔠 Letra +") { wv.settings.textZoom = (wv.settings.textZoom + 15).coerceAtMost(250) }
                     btn("🔡 Letra −") { wv.settings.textZoom = (wv.settings.textZoom - 15).coerceAtLeast(60) }

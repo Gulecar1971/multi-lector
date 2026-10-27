@@ -63,7 +63,10 @@ class MainActivity : Activity() {
         box.addView(bigButton("📂  Abrir un archivo", "PDF, Word, Excel, PowerPoint, fotos, textos, ePub, ZIP, videos…", Pal.primary) { pickOpen() })
         box.addView(bigButton("🔄  Convertir a PDF", "Uno o varios archivos: Word, Excel, textos, fotos… a PDF", Pal.accent) { pickAny(REQ_CONVERT, true) })
         box.addView(bigButton("🖼  Fotos a PDF", "Van enteras: si después las sacás del PDF, salen iguales", Pal.teal) { pickImages(REQ_IMG2PDF) })
-        box.addView(bigButton("📷  Sacar fotos y armar PDF", "Escaneá facturas, recibos, documentos con la cámara", Pal.orange) { takePhoto() })
+        box.addView(bigButton("📷  Escanear documentos", "Recorta, endereza y limpia la hoja. Juntá varias hojas y guardalas en PDF", Pal.orange) {
+            startActivity(Intent(this, ScanActivity::class.java))
+        })
+        box.addView(bigButton("🖨  Imprimir", "PDF, fotos, Word, Excel… en tus impresoras HP (color o blanco y negro)", Color.parseColor("#0D47A1")) { pickAny(REQ_PRINT, true) })
         box.addView(bigButton("📤  Sacar las fotos de un PDF", "Recupera las fotos originales que tiene adentro", Pal.purple) { pickAny(REQ_EXTRACT, false, "application/pdf") })
         box.addView(bigButton("📐  Achicar / cambiar fotos", "WhatsApp, Instagram, Mercado Libre, carnet, trámites…", Pal.pink) { PhotoActivity.start(this, emptyList()) })
         box.addView(bigButton("🧰  Más herramientas PDF", "Unir, achicar, pasar páginas a fotos", Pal.slate) { moreTools() })
@@ -200,6 +203,7 @@ class MainActivity : Activity() {
         } catch (_: Exception) {}
         when (requestCode) {
             REQ_OPEN -> F.view(this, uris[0])
+            REQ_PRINT -> Printer.any(this, uris)
             REQ_CONVERT -> askTogether(uris) { Ops.toPdf(this, uris, it) }
             REQ_IMG2PDF -> ViewerActivity.askPhotoPdf(this, uris)
             REQ_EXTRACT -> Ops.extractImages(this, uris[0])
@@ -244,6 +248,7 @@ class MainActivity : Activity() {
         val allImg = kinds.all { it == Kind.IMAGE }
         val onePdf = uris.size == 1 && kinds[0] == Kind.PDF
         if (uris.size == 1) opts += "👁 Ver" to { F.view(this, uris[0]) }
+        if ((uris.size == 1 && kinds[0].convertible) || allImg) opts += "🖨 Imprimir" to { Printer.any(this, uris) }
         if (allImg) opts += "🖼 Fotos a PDF (enteras)" to { ViewerActivity.askPhotoPdf(this, uris) }
         if (allImg) opts += "📐 Achicar / cambiar fotos" to { PhotoActivity.start(this, uris) }
         if (!allImg && !onePdf) opts += "🔄 Convertir a PDF" to { askTogether(uris) { Ops.toPdf(this, uris, it) } }
@@ -265,6 +270,7 @@ class MainActivity : Activity() {
         const val REQ_COMPRESS = 7
         const val REQ_PAGES = 8
         const val REQ_CAMERA = 9
+        const val REQ_PRINT = 10
 
         fun urisFrom(data: Intent): List<Uri> {
             val out = ArrayList<Uri>()
