@@ -261,7 +261,8 @@ object Scan {
             while (a <= 12.0) { val sc = score(a); if (sc > bestS) { bestS = sc; best = a }; a += 0.5 }
             var f = best - 0.5
             while (f <= best + 0.5) { val sc = score(f); if (sc > bestS) { bestS = sc; best = f }; f += 0.1 }
-            if (Math.abs(best) < 0.25 || bestS < base * 1.08) return 0f
+            // solo endereza si está seguro: renglones claramente torcidos y no más de 10°
+            if (Math.abs(best) < 0.4 || Math.abs(best) > 10 || bestS < base * 1.15) return 0f
             return best.toFloat()
         } catch (_: Throwable) {
             return 0f
@@ -326,19 +327,21 @@ object Scan {
         return r
     }
 
-    /** Enderezado fino (pocos grados) y espejo, sin dejar bordes vacíos. */
+    /** Enderezado fino (pocos grados) y espejo, sin recortar la hoja. */
     fun straighten(b: Bitmap, angle: Float, mirror: Boolean): Bitmap {
         if (Math.abs(angle) < 0.05f && !mirror) return b
         val w = b.width.toFloat(); val h = b.height.toFloat()
         val rad = Math.toRadians(Math.abs(angle).toDouble())
-        val cover = (Math.cos(rad) + Math.sin(rad) * maxOf(w / h, h / w)).toFloat()
+        // achica apenas para que entre la hoja entera (no recorta nada; las esquinas quedan blancas)
+        val c = Math.cos(rad); val sn = Math.sin(rad)
+        val fit = minOf(w / (w * c + h * sn), h / (w * sn + h * c)).toFloat()
         val out = Bitmap.createBitmap(b.width, b.height, Bitmap.Config.ARGB_8888)
         out.eraseColor(Color.WHITE)
         val m = Matrix()
         m.postTranslate(-w / 2, -h / 2)
         if (mirror) m.postScale(-1f, 1f)
         m.postRotate(angle)
-        m.postScale(cover, cover)
+        m.postScale(fit, fit)
         m.postTranslate(w / 2, h / 2)
         Canvas(out).drawBitmap(b, m, Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG))
         b.recycle()
