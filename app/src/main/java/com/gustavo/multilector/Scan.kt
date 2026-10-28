@@ -224,7 +224,7 @@ object Scan {
      * Mide cuánto están torcidos los renglones del texto (en grados). 0 si no se puede saber.
      * Para enderezar hay que girar al revés: straighten(-angulo).
      */
-    fun textSkew(b: Bitmap): Float {
+    fun textSkew(b: Bitmap, sensitive: Boolean = false): Float {
         try {
             val s = 900f / maxOf(b.width, b.height)
             val w = maxOf(8, (b.width * minOf(1f, s)).toInt()); val h = maxOf(8, (b.height * minOf(1f, s)).toInt())
@@ -257,12 +257,13 @@ object Scan {
             }
             var best = 0.0; var bestS = score(0.0)
             val base = bestS
-            var a = -12.0
-            while (a <= 12.0) { val sc = score(a); if (sc > bestS) { bestS = sc; best = a }; a += 0.5 }
+            var a = -15.0
+            while (a <= 15.0) { val sc = score(a); if (sc > bestS) { bestS = sc; best = a }; a += 0.5 }
             var f = best - 0.5
             while (f <= best + 0.5) { val sc = score(f); if (sc > bestS) { bestS = sc; best = f }; f += 0.1 }
             // solo endereza si está seguro: renglones claramente torcidos y no más de 10°
-            if (Math.abs(best) < 0.4 || Math.abs(best) > 10 || bestS < base * 1.15) return 0f
+            if (sensitive) { if (Math.abs(best) < 0.2 || bestS < base * 1.03) return 0f }
+            else if (Math.abs(best) < 0.4 || Math.abs(best) > 10 || bestS < base * 1.15) return 0f
             return best.toFloat()
         } catch (_: Throwable) {
             return 0f

@@ -678,9 +678,40 @@ class PageEditor(
         panelScroll(box)
     }
 
+    /** Enderezar automático: busca los bordes de la hoja (perspectiva) y alinea los renglones del texto. */
+    private fun autoStraighten() {
+        spinner.visibility = View.VISIBLE
+        toast("Enderezando…")
+        exec.execute {
+            val dq = Scan.detect(src)
+            val area = Scan.quadArea(dq)
+            // solo cambia el recorte si encontró una hoja con fondo alrededor
+            val q = if (area in 0.25f..0.92f && !dq.contentEquals(Scan.fullQuad())) dq else cur.quad
+            val sk = try { Scan.textSkew(Scan.rotate(Scan.warp(src, q, 1200f), cur.rot), sensitive = true) } catch (_: Throwable) { 0f }
+            main.post {
+                spinner.visibility = View.GONE
+                val next = cur.copy(quad = q, angle = -sk)
+                if (next == cur) toast("La hoja ya está derecha")
+                else {
+                    push(next)
+                    toast(if (sk != 0f) "Enderezada ${String.format(Locale.ROOT, "%.1f", Math.abs(sk))}°" else "Hoja encuadrada")
+                }
+                panel.removeAllViews()
+                when (tab) { 1 -> filterPanel(); 3 -> rotatePanel(); else -> {} }
+            }
+        }
+    }
+
     private fun filterPanel() {
         val sc = HorizontalScrollView(act)
         val r = row()
+        val auto = act.vbox()
+        auto.background = rounded(Color.parseColor("#0D47A1"), act.dpf(12f))
+        auto.setPadding(act.dp(12), act.dp(10), act.dp(12), act.dp(10))
+        auto.addView(act.label("📐 Enderezar automático", 15f, Color.WHITE, true))
+        auto.addView(act.label("Encuadra la hoja y alinea los renglones" + if (cur.angle != 0f) " (ahora: ${fmt(cur.angle)}°)" else "", 12f, Color.argb(220, 255, 255, 255)).apply { maxWidth = act.dp(150) })
+        auto.setOnClickListener { autoStraighten() }
+        r.addView(auto, lp(act.dp(170), MATCH).apply { marginEnd = act.dp(8) })
         ScanFilter.values().forEach { f ->
             val sel = f == cur.filter
             val chip = act.vbox()
@@ -765,16 +796,7 @@ class PageEditor(
         rr.addView(sb, lp(0, WRAP, 1f))
         box.addView(rr)
         val r2 = row()
-        r2.addView(act.smallButton("📐 Enderezar solo (según el texto)", Pal.accent) {
-            spinner.visibility = View.VISIBLE
-            exec.execute {
-                val sk = Scan.textSkew(Scan.rotate(Scan.warp(src, cur.quad, 1200f), cur.rot))
-                main.post {
-                    spinner.visibility = View.GONE
-                    if (sk == 0f) toast("Ya está derecho (o no encontré renglones de texto)") else { push(cur.copy(angle = -sk)); panel.removeAllViews(); rotatePanel() }
-                }
-            }
-        }, lp(MATCH, WRAP))
+        r2.addView(act.smallButton("📐 Enderezar automático", Pal.accent) { autoStraighten() }, lp(MATCH, WRAP))
         box.addView(r2)
         box.addView(act.label("Usá Enderezar si las líneas del texto quedaron un poco torcidas.", 12.5f, Color.LTGRAY).apply { setPadding(act.dp(12), act.dp(4), act.dp(12), 0) })
         panelScroll(box)
