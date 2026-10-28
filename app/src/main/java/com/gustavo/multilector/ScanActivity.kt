@@ -340,10 +340,10 @@ class ScanActivity : Activity() {
         for (path in files) {
             val small = loadSrc(path, 1600) ?: continue
             val q = if (detect) Scan.detect(small) else Scan.fullQuad(0f)
-            // enderezado automático: mide lo torcido de los renglones después de recortar
-            val skew = if (detect) Scan.textSkew(Scan.warp(small, q, 1200f)) else Scan.textSkew(small)
+            // enderezado automático: aplana la perspectiva con las líneas del documento, o gira según los renglones
+            val (flat, ang) = try { Scan.autoFix(small, q, 0, false) } catch (_: Throwable) { null to 0f }
             small.recycle()
-            val auto = Edit(q, angle = -skew, filter = filter, sharp = if (filter == ScanFilter.ORIGINAL) 0 else 25)
+            val auto = Edit(q, angle = ang, flat = flat, filter = filter, sharp = if (filter == ScanFilter.ORIGINAL) 0 else 25)
             val p = Page(path, auto, auto, File(dir, "hoja_${System.nanoTime()}.jpg").path)
             render(p)
             runOnUiThread { pages.add(p) }
@@ -517,7 +517,7 @@ class PageEditor(
         val top2 = act.hbox()
         top2.setPadding(act.dp(8), 0, act.dp(8), act.dp(6))
         top2.addView(icon("⟲ Volver al original") { push(page.auto); toast("Volvió al retoque automático") })
-        top2.addView(icon("📷 Sin retoques") { push(cur.copy(filter = ScanFilter.ORIGINAL, bright = 0, contrast = 0, sat = 0, sharp = 0, angle = 0f, mirror = false)) })
+        top2.addView(icon("📷 Sin retoques") { push(cur.copy(filter = ScanFilter.ORIGINAL, bright = 0, contrast = 0, sat = 0, sharp = 0, angle = 0f, mirror = false, flat = null, clean = false)) })
         top2.addView(icon("✨ Auto") { autoAgain() })
         addView(HorizontalScrollView(act).apply { isHorizontalScrollBarEnabled = false; addView(top2) }, lp(MATCH, WRAP))
 
@@ -596,11 +596,11 @@ class PageEditor(
         spinner.visibility = View.VISIBLE
         exec.execute {
             val q = Scan.detect(src)
-            val skew = Scan.textSkew(Scan.warp(src, q, 1200f))
+            val (flat, ang) = try { Scan.autoFix(src, q, 0, false) } catch (_: Throwable) { null to 0f }
             main.post {
                 spinner.visibility = View.GONE
                 push(cur.copy(quad = q, filter = if (cur.filter == ScanFilter.ORIGINAL) ScanFilter.ENHANCED else cur.filter,
-                    bright = 0, contrast = 0, sat = 0, sharp = 25, shadows = true, angle = -skew, rot = 0, mirror = false))
+                    bright = 0, contrast = 0, sat = 0, sharp = 25, shadows = true, angle = ang, flat = flat, clean = true, rot = 0, mirror = false))
                 toast("Retoque automático aplicado")
             }
         }
@@ -655,7 +655,7 @@ class PageEditor(
         spinner.visibility = View.GONE
         previewView.visibility = View.GONE
         if (crop == null) {
-            val c = CropView(act, src, cur.quad.copyOf()) { q -> push(cur.copy(quad = q)) }
+            val c = CropView(act, src, cur.quad.copyOf()) { q -> push(cur.copy(quad = q, flat = null)) }
             crop = c
             stage.addView(c, 0, FrameLayout.LayoutParams(MATCH, MATCH))
         } else crop?.setQuad(cur.quad)
@@ -671,8 +671,8 @@ class PageEditor(
         val box = act.vbox()
         box.addView(act.label("Arrastrá los 4 puntos a las esquinas de la hoja. Aparece una lupa para acertar.", 13.5f, Color.LTGRAY).apply { setPadding(act.dp(12), act.dp(10), act.dp(12), 0) })
         val r = row()
-        r.addView(act.smallButton("🎯 Detectar hoja", Pal.slate) { spinner.visibility = View.VISIBLE; exec.execute { val q = Scan.detect(src); main.post { spinner.visibility = View.GONE; push(cur.copy(quad = q)) } } }, lp(0, WRAP, 1f).apply { marginEnd = act.dp(6) })
-        r.addView(act.smallButton("🔲 Toda la foto", Pal.slate) { push(cur.copy(quad = Scan.fullQuad(0f))) }, lp(0, WRAP, 1f).apply { marginEnd = act.dp(6) })
+        r.addView(act.smallButton("🎯 Detectar hoja", Pal.slate) { spinner.visibility = View.VISIBLE; exec.execute { val q = Scan.detect(src); main.post { spinner.visibility = View.GONE; push(cur.copy(quad = q, flat = null)) } } }, lp(0, WRAP, 1f).apply { marginEnd = act.dp(6) })
+        r.addView(act.smallButton("🔲 Toda la foto", Pal.slate) { push(cur.copy(quad = Scan.fullQuad(0f), flat = null)) }, lp(0, WRAP, 1f).apply { marginEnd = act.dp(6) })
         r.addView(act.smallButton("👁 Ver resultado", Pal.accent) { selectTab(1) }, lp(0, WRAP, 1f))
         box.addView(r)
         panelScroll(box)
@@ -687,14 +687,18 @@ class PageEditor(
             val area = Scan.quadArea(dq)
             // solo cambia el recorte si encontró una hoja con fondo alrededor
             val q = if (area in 0.25f..0.92f && !dq.contentEquals(Scan.fullQuad())) dq else cur.quad
-            val sk = try { Scan.textSkew(Scan.rotate(Scan.warp(src, q, 1200f), cur.rot), sensitive = true) } catch (_: Throwable) { 0f }
+            val (flat, ang) = try { Scan.autoFix(src, q, cur.rot, true) } catch (_: Throwable) { null to 0f }
             main.post {
                 spinner.visibility = View.GONE
-                val next = cur.copy(quad = q, angle = -sk)
+                val next = cur.copy(quad = q, flat = flat, angle = ang, clean = true)
                 if (next == cur) toast("La hoja ya está derecha")
                 else {
                     push(next)
-                    toast(if (sk != 0f) "Enderezada ${String.format(Locale.ROOT, "%.1f", Math.abs(sk))}°" else "Hoja encuadrada")
+                    toast(when {
+                        flat != null -> "Perspectiva corregida: la hoja quedó derecha"
+                        ang != 0f -> "Enderezada ${String.format(Locale.ROOT, "%.1f", Math.abs(ang))}°"
+                        else -> "Hoja encuadrada"
+                    })
                 }
                 panel.removeAllViews()
                 when (tab) { 1 -> filterPanel(); 3 -> rotatePanel(); else -> {} }
@@ -709,7 +713,7 @@ class PageEditor(
         auto.background = rounded(Color.parseColor("#0D47A1"), act.dpf(12f))
         auto.setPadding(act.dp(12), act.dp(10), act.dp(12), act.dp(10))
         auto.addView(act.label("📐 Enderezar automático", 15f, Color.WHITE, true))
-        auto.addView(act.label("Encuadra la hoja y alinea los renglones" + if (cur.angle != 0f) " (ahora: ${fmt(cur.angle)}°)" else "", 12f, Color.argb(220, 255, 255, 255)).apply { maxWidth = act.dp(150) })
+        auto.addView(act.label("Corrige la perspectiva y alinea los renglones" + when { cur.flat != null -> " (aplicado ✓)"; cur.angle != 0f -> " (girada ${fmt(cur.angle)}°)"; else -> "" }, 12f, Color.argb(220, 255, 255, 255)).apply { maxWidth = act.dp(150) })
         auto.setOnClickListener { autoStraighten() }
         r.addView(auto, lp(act.dp(170), MATCH).apply { marginEnd = act.dp(8) })
         ScanFilter.values().forEach { f ->
@@ -763,6 +767,12 @@ class PageEditor(
         cb.isChecked = cur.shadows
         cb.setOnCheckedChangeListener { _, v -> push(cur.copy(shadows = v)) }
         box.addView(cb, lp(WRAP, WRAP).apply { marginStart = act.dp(8) })
+        val cb2 = CheckBox(act)
+        cb2.text = "Limpiar franjas oscuras de los bordes"
+        cb2.setTextColor(Color.WHITE)
+        cb2.isChecked = cur.clean
+        cb2.setOnCheckedChangeListener { _, v -> push(cur.copy(clean = v)) }
+        box.addView(cb2, lp(WRAP, WRAP).apply { marginStart = act.dp(8) })
         val r = row()
         r.addView(act.smallButton("↺ Ajustes a cero", Pal.slate) { push(cur.copy(bright = 0, contrast = 0, sat = 0, sharp = 30)); panel.removeAllViews(); adjustPanel() })
         box.addView(r)
@@ -772,8 +782,8 @@ class PageEditor(
     private fun rotatePanel() {
         val box = act.vbox()
         val r = row()
-        r.addView(act.smallButton("⟲ 90° izq.", Pal.slate) { push(cur.copy(rot = (cur.rot + 270) % 360)) }, lp(0, WRAP, 1f).apply { marginEnd = act.dp(6) })
-        r.addView(act.smallButton("⟳ 90° der.", Pal.slate) { push(cur.copy(rot = (cur.rot + 90) % 360)) }, lp(0, WRAP, 1f).apply { marginEnd = act.dp(6) })
+        r.addView(act.smallButton("⟲ 90° izq.", Pal.slate) { push(cur.copy(rot = (cur.rot + 270) % 360, flat = null)) }, lp(0, WRAP, 1f).apply { marginEnd = act.dp(6) })
+        r.addView(act.smallButton("⟳ 90° der.", Pal.slate) { push(cur.copy(rot = (cur.rot + 90) % 360, flat = null)) }, lp(0, WRAP, 1f).apply { marginEnd = act.dp(6) })
         r.addView(act.smallButton("⇋ Espejo", Pal.slate) { push(cur.copy(mirror = !cur.mirror)) }, lp(0, WRAP, 1f))
         box.addView(r)
         // enderezado fino en medios grados

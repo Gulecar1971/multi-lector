@@ -31,10 +31,13 @@ data class Edit(
     val contrast: Int = 0,     // -100..100
     val sat: Int = 0,          // -100..100
     val sharp: Int = 30,       // 0..100
-    val shadows: Boolean = true
+    val shadows: Boolean = true,
+    val flat: FloatArray? = null,   // perspectiva a corregir (cuadrilátero en la hoja ya recortada)
+    val clean: Boolean = true       // limpiar franjas oscuras de los bordes
 ) {
     fun toJson(): JSONObject = JSONObject().put("q", JSONArray(quad.map { it.toDouble() })).put("rot", rot).put("ang", angle.toDouble())
         .put("mir", mirror).put("f", filter.name).put("b", bright).put("c", contrast).put("s", sat).put("sh", sharp).put("so", shadows)
+        .put("fl", flat?.let { f -> JSONArray(f.map { it.toDouble() }) } ?: JSONObject.NULL).put("cl", clean)
 
     override fun equals(other: Any?) = other is Edit && toJson().toString() == other.toJson().toString()
     override fun hashCode() = toJson().toString().hashCode()
@@ -44,7 +47,8 @@ data class Edit(
             val q = o.getJSONArray("q")
             return Edit(FloatArray(8) { q.getDouble(it).toFloat() }, o.optInt("rot"), o.optDouble("ang", 0.0).toFloat(), o.optBoolean("mir"),
                 try { ScanFilter.valueOf(o.optString("f", "ENHANCED")) } catch (_: Exception) { ScanFilter.ENHANCED },
-                o.optInt("b"), o.optInt("c"), o.optInt("s"), o.optInt("sh", 30), o.optBoolean("so", true))
+                o.optInt("b"), o.optInt("c"), o.optInt("s"), o.optInt("sh", 30), o.optBoolean("so", true),
+                o.optJSONArray("fl")?.let { a -> FloatArray(8) { a.getDouble(it).toFloat() } }, o.optBoolean("cl", true))
         }
     }
 }
@@ -267,6 +271,207 @@ object Scan {
             return best.toFloat()
         } catch (_: Throwable) {
             return 0f
+        }
+    }
+
+    // ================= Enderezado de perspectiva (hoja "en trapecio") =================
+
+    /** Resultado de rectify: esquinas a recortar (normalizadas) y si se encontraron líneas rectas para corregir. */
+    class Rectified(val quad: FloatArray, val usedLines: Boolean)
+
+    /** Homografía que lleva 4 puntos src a 4 puntos dst (x0,y0,x1,y1,…). */
+    fun homography(src: DoubleArray, dst: DoubleArray): DoubleArray? {
+        val a = Array(8) { DoubleArray(9) }
+        for (i in 0 until 4) {
+            val x = src[i * 2]; val y = src[i * 2 + 1]; val u = dst[i * 2]; val v = dst[i * 2 + 1]
+            a[i * 2] = doubleArrayOf(x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y, u)
+            a[i * 2 + 1] = doubleArrayOf(0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y, v)
+        }
+        for (c in 0 until 8) {
+            var piv = c
+            for (r in c + 1 until 8) if (Math.abs(a[r][c]) > Math.abs(a[piv][c])) piv = r
+            if (Math.abs(a[piv][c]) < 1e-12) return null
+            val t = a[c]; a[c] = a[piv]; a[piv] = t
+            for (r in 0 until 8) if (r != c) {
+                val f = a[r][c] / a[c][c]
+                for (k in c until 9) a[r][k] -= f * a[c][k]
+            }
+        }
+        val h = DoubleArray(9)
+        for (i in 0 until 8) h[i] = a[i][8] / a[i][i]
+        h[8] = 1.0
+        return h
+    }
+
+    fun applyH(h: DoubleArray, x: Double, y: Double): DoubleArray {
+        val w = h[6] * x + h[7] * y + h[8]
+        return doubleArrayOf((h[0] * x + h[1] * y + h[2]) / w, (h[3] * x + h[4] * y + h[5]) / w)
+    }
+
+    fun invertH(m: DoubleArray): DoubleArray? {
+        val a = m[0]; val b = m[1]; val c = m[2]; val d = m[3]; val e = m[4]; val f = m[5]; val g = m[6]; val h = m[7]; val i = m[8]
+        val det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+        if (Math.abs(det) < 1e-12) return null
+        return doubleArrayOf(
+            (e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det,
+            (f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det,
+            (d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det)
+    }
+
+    private class Ln(val theta: Double, val rho: Double, val votes: Int)
+
+    /** Líneas rectas largas (bordes de tablas, recuadros, borde del papel) casi horizontales o casi verticales. */
+    private fun longLines(lum: IntArray, w: Int, h: Int, horizontal: Boolean): List<Ln> {
+        val mag = BooleanArray(w * h)
+        // borde fuerte: cambio de claro a oscuro en la dirección perpendicular a la línea
+        var cnt = 0
+        for (y in 1 until h - 1) for (x in 1 until w - 1) {
+            val i = y * w + x
+            val g = if (horizontal) Math.abs(lum[i + w] - lum[i - w]) else Math.abs(lum[i + 1] - lum[i - 1])
+            if (g > 40) { mag[i] = true; cnt++ }
+        }
+        if (cnt < 50) return emptyList()
+        val step = 0.25
+        val n = (40 / step).toInt() + 1 // -20..+20 grados alrededor de la dirección
+        val thetas = DoubleArray(n) { Math.toRadians((if (horizontal) 90.0 else 0.0) - 20.0 + it * step) }
+        val cs = DoubleArray(n) { Math.cos(thetas[it]) }; val sn = DoubleArray(n) { Math.sin(thetas[it]) }
+        val diag = Math.hypot(w.toDouble(), h.toDouble()).toInt() + 2
+        val stride = 2 * diag + 1
+        val votes = IntArray(n * stride)
+        for (y in 1 until h - 1) for (x in 1 until w - 1) {
+            if (!mag[y * w + x]) continue
+            for (t in 0 until n) votes[t * stride + (Math.round(x * cs[t] + y * sn[t]).toInt() + diag)]++
+        }
+        val minVotes = (if (horizontal) w else h) * 0.28
+        val out = ArrayList<Ln>()
+        for (t in 0 until n) for (r in 2 until stride - 2) {
+            val v = votes[t * stride + r]
+            if (v < minVotes) continue
+            var ok = true
+            loop@ for (dt in -6..6) for (dr in -6..6) {
+                if (dt == 0 && dr == 0) continue
+                val tt = t + dt; val rr = r + dr
+                if (tt < 0 || tt >= n) continue
+                if (votes[tt * stride + rr] > v || (votes[tt * stride + rr] == v && (dt < 0 || (dt == 0 && dr < 0)))) { ok = false; break@loop }
+            }
+            if (ok) out.add(Ln(thetas[t], (r - diag).toDouble(), v))
+        }
+        return out
+    }
+
+    private fun lineAt(l: Ln, horizontal: Boolean, c: Double): Double =
+        if (horizontal) (l.rho - c * Math.cos(l.theta)) / Math.sin(l.theta) else (l.rho - c * Math.sin(l.theta)) / Math.cos(l.theta)
+
+    private fun cross(a: Ln, b: Ln): DoubleArray? {
+        val det = Math.cos(a.theta) * Math.sin(b.theta) - Math.sin(a.theta) * Math.cos(b.theta)
+        if (Math.abs(det) < 1e-9) return null
+        return doubleArrayOf((a.rho * Math.sin(b.theta) - b.rho * Math.sin(a.theta)) / det, (b.rho * Math.cos(a.theta) - a.rho * Math.cos(b.theta)) / det)
+    }
+
+    /**
+     * Endereza la hoja como un escáner: busca líneas rectas (tablas, recuadros, borde del papel),
+     * corrige la perspectiva para que queden derechas y paralelas, y recorta bordes oscuros.
+     * Devuelve las esquinas a usar con warp(), o null si no hay nada para corregir.
+     */
+    fun rectify(b: Bitmap): Rectified? {
+        try {
+            val s = 1000f / maxOf(b.width, b.height)
+            val w = maxOf(16, (b.width * minOf(1f, s)).toInt()); val h = maxOf(16, (b.height * minOf(1f, s)).toInt())
+            val small = Bitmap.createScaledBitmap(b, w, h, true)
+            val px = IntArray(w * h)
+            small.getPixels(px, 0, w, 0, 0, w, h)
+            if (small !== b) small.recycle()
+            val lum = IntArray(w * h) { val p = px[it]; (((p shr 16) and 0xFF) * 299 + ((p shr 8) and 0xFF) * 587 + (p and 0xFF) * 114) / 1000 }
+
+            val hs = longLines(lum, w, h, true)
+            val vs = longLines(lum, w, h, false)
+            if (System.getProperty("scan.debug") != null) {
+                hs.forEach { println("H th=%.2f y@mid=%.1f v=%d".format(Math.toDegrees(it.theta), lineAt(it, true, w / 2.0), it.votes)) }
+                vs.forEach { println("V th=%.2f x@mid=%.1f v=%d".format(Math.toDegrees(it.theta), lineAt(it, false, h / 2.0), it.votes)) }
+            }
+            fun pick(c: List<Ln>, horizontal: Boolean, first: Boolean): Ln? {
+                val mid = if (horizontal) w / 2.0 else h / 2.0
+                val size = if (horizontal) h else w
+                // fuera los bordes de la foto (sombras, borde de la mesa) y las "líneas" falsas que forma el texto
+                val inside = c.filter { val p = lineAt(it, horizontal, mid); p > size * 0.04 && p < size * 0.96 }
+                val best = inside.maxOfOrNull { it.votes } ?: return null
+                val strong = inside.filter { it.votes >= best * 0.6 }
+                return if (first) strong.minByOrNull { lineAt(it, horizontal, mid) } else strong.maxByOrNull { lineAt(it, horizontal, mid) }
+            }
+            var top = pick(hs, true, true); var bot = pick(hs, true, false)
+            var left = pick(vs, false, true); var right = pick(vs, false, false)
+            if (top != null && bot != null && lineAt(bot, true, w / 2.0) - lineAt(top, true, w / 2.0) < h * 0.25) {
+                // una sola línea horizontal: la usamos para la dirección, abajo va una paralela
+                bot = Ln(top.theta, top.rho + h * 0.5, top.votes)
+            }
+            if (left != null && right != null && lineAt(right, false, h / 2.0) - lineAt(left, false, h / 2.0) < w * 0.25) {
+                right = Ln(left.theta, left.rho + w * 0.5, left.votes)
+            }
+            val haveH = top != null && bot != null
+            val haveV = left != null && right != null
+            var usedLines = haveH || haveV
+            if (!haveH && haveV) {
+                // líneas horizontales perpendiculares a las verticales
+                val th = (left!!.theta + right!!.theta) / 2 + Math.PI / 2
+                top = Ln(th, h * 0.15 * Math.sin(th) + w * 0.5 * Math.cos(th), 0); bot = Ln(th, h * 0.85 * Math.sin(th) + w * 0.5 * Math.cos(th), 0)
+            }
+            if (haveH && !haveV) {
+                val th = (top!!.theta + bot!!.theta) / 2 - Math.PI / 2
+                left = Ln(th, w * 0.15 * Math.cos(th) + h * 0.5 * Math.sin(th), 0); right = Ln(th, w * 0.85 * Math.cos(th) + h * 0.5 * Math.sin(th), 0)
+            }
+            var hm = doubleArrayOf(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+            if (usedLines) {
+                val tl = cross(top!!, left!!); val tr = cross(top, right!!); val br = cross(bot!!, right); val bl = cross(bot, left)
+                if (tl == null || tr == null || br == null || bl == null) usedLines = false
+                else {
+                    val x0 = (tl[0] + bl[0]) / 2; val x1 = (tr[0] + br[0]) / 2
+                    val y0 = (tl[1] + tr[1]) / 2; val y1 = (bl[1] + br[1]) / 2
+                    val hh = homography(doubleArrayOf(tl[0], tl[1], tr[0], tr[1], br[0], br[1], bl[0], bl[1]),
+                        doubleArrayOf(x0, y0, x1, y0, x1, y1, x0, y1))
+                    if (hh == null) usedLines = false else hm = hh
+                }
+            }
+            val inv = invertH(hm) ?: return null
+            // zona útil: la imagen completa vista desde el lado corregido
+            val c0 = applyH(hm, 0.0, 0.0); val c1 = applyH(hm, w.toDouble(), 0.0); val c2 = applyH(hm, w.toDouble(), h.toDouble()); val c3 = applyH(hm, 0.0, h.toDouble())
+            var bx0 = maxOf(c0[0], c3[0]); var bx1 = minOf(c1[0], c2[0]); var by0 = maxOf(c0[1], c1[1]); var by1 = minOf(c2[1], c3[1])
+            if (bx1 - bx0 < w * 0.5 || by1 - by0 < h * 0.5) return null
+
+            // recortar bordes oscuros (sombra, mesa, borde de otra hoja)
+            val sorted = lum.copyOf(); sorted.sort()
+            val paper = sorted[(sorted.size * 0.9).toInt()]
+            val dark = paper * 0.62
+            fun darkFrac(horizontalLine: Boolean, pos: Double, a0: Double, a1: Double): Double {
+                var d = 0; var t = 0
+                val nS = 160
+                for (k in 0 until nS) {
+                    val q = a0 + (a1 - a0) * (k + 0.5) / nS
+                    val p = if (horizontalLine) applyH(inv, q, pos) else applyH(inv, pos, q)
+                    val xi = p[0].toInt(); val yi = p[1].toInt()
+                    if (xi < 0 || yi < 0 || xi >= w || yi >= h) { d++; t++; continue }
+                    if (lum[yi * w + xi] < dark) d++
+                    t++
+                }
+                return d.toDouble() / t
+            }
+            val maxCutX = (bx1 - bx0) * 0.12; val maxCutY = (by1 - by0) * 0.12
+            val stp = 1.0
+            run { var c = 0.0; while (c < maxCutY && darkFrac(true, by0 + c, bx0, bx1) > 0.12) c += stp; by0 += c + if (c > 0) 2 else 0 }
+            run { var c = 0.0; while (c < maxCutY && darkFrac(true, by1 - c, bx0, bx1) > 0.12) c += stp; by1 -= c + if (c > 0) 2 else 0 }
+            run { var c = 0.0; while (c < maxCutX && darkFrac(false, bx0 + c, by0, by1) > 0.12) c += stp; bx0 += c + if (c > 0) 2 else 0 }
+            run { var c = 0.0; while (c < maxCutX && darkFrac(false, bx1 - c, by0, by1) > 0.12) c += stp; bx1 -= c + if (c > 0) 2 else 0 }
+
+            val corners = listOf(applyH(inv, bx0, by0), applyH(inv, bx1, by0), applyH(inv, bx1, by1), applyH(inv, bx0, by1))
+            val q = FloatArray(8)
+            corners.forEachIndexed { k, p -> q[k * 2] = (p[0] / w).toFloat(); q[k * 2 + 1] = (p[1] / h).toFloat() }
+            // si casi no cambia nada, no tocamos la hoja
+            var diff = 0f
+            val full = fullQuad(0f)
+            for (k in 0 until 8) diff = maxOf(diff, Math.abs(q[k] - full[k]))
+            if (diff < 0.004f) return null
+            return Rectified(q, usedLines)
+        } catch (_: Throwable) {
+            return null
         }
     }
 
@@ -501,12 +706,53 @@ object Scan {
         return r
     }
 
+    private fun pixels(b: Bitmap): IntArray { val px = IntArray(b.width * b.height); b.getPixels(px, 0, b.width, 0, 0, b.width, b.height); return px }
+
+    private fun toBitmap(px: IntArray, w: Int, h: Int): Bitmap {
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        out.setPixels(px, 0, w, 0, 0, w, h)
+        return out
+    }
+
+    /** Aplana la perspectiva (la hoja que se ve como trapecio pasa a ser rectángulo). */
+    fun flattenBitmap(b: Bitmap, q: FloatArray, maxSide: Int): Bitmap {
+        val (o, w, h) = Rectify.flatten(pixels(b), b.width, b.height, q, maxSide)
+        b.recycle()
+        return toBitmap(o, w, h)
+    }
+
+    /** Blanquea las franjas oscuras de los bordes (mesa, sombras). */
+    fun cleanBitmap(b: Bitmap): Bitmap {
+        val px = pixels(b)
+        Rectify.cleanBorders(px, b.width, b.height)
+        val out = toBitmap(px, b.width, b.height)
+        b.recycle()
+        return out
+    }
+
+    /**
+     * Enderezado automático completo: primero intenta aplanar la perspectiva con las líneas del documento;
+     * si no hay líneas claras, gira según los renglones del texto.
+     * Devuelve (cuadrilátero de perspectiva o null, ángulo de giro).
+     */
+    fun autoFix(src: Bitmap, quad: FloatArray, rot: Int, sensitive: Boolean): Pair<FloatArray?, Float> {
+        val warped = rotate(warp(src, quad, 1400f), rot)
+        val px = pixels(warped)
+        val q = try { Rectify.findQuad(px, warped.width, warped.height) } catch (_: Throwable) { null }
+        if (q != null && Rectify.isSkewed(q, warped.width, warped.height)) { warped.recycle(); return q to 0f }
+        val sk = textSkew(warped, sensitive)
+        warped.recycle()
+        return null to -sk
+    }
+
     /** Proceso completo de una hoja con todos sus retoques. */
     fun process(src: Bitmap, e: Edit, maxSide: Float = 3300f): Bitmap {
         val full = e.quad.contentEquals(fullQuad(0f))
         var b = if (full && maxOf(src.width, src.height) <= maxSide) src.copy(Bitmap.Config.ARGB_8888, true) else warp(src, e.quad, maxSide)
         b = rotate(b, e.rot)
+        e.flat?.let { q -> b = flattenBitmap(b, q, maxSide.toInt()) }
         b = straighten(b, e.angle, e.mirror)
+        if (e.clean) b = cleanBitmap(b)
         b = filter(b, e.filter, e.shadows)
         b = adjust(b, e.bright, e.contrast + if (e.filter == ScanFilter.MAGIC) 12 else 0, e.sat + if (e.filter == ScanFilter.MAGIC) 45 else 0)
         // la nitidez se ajusta al tamaño para que la vista previa se parezca al resultado final
